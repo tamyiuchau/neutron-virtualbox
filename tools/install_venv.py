@@ -39,7 +39,7 @@ def print_help():
  To activate the Neutron virtualenv for the extent of your current shell
  session you can run:
 
- $ source .venv/bin/activate
+ $ . .venv/bin/activate
 
  Or, if you prefer, you can run commands in the virtualenv on a case by case
  basis by running:
@@ -52,8 +52,15 @@ def print_help():
 
 
 def main(argv):
-    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    venv = os.path.join(root, '.venv')
+    if 'tools_path' in os.environ:
+        root = os.environ['tools_path']
+    else:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if 'venv' in os.environ:
+        venv = os.environ['venv']
+    else:
+        venv = os.path.join(root, '.venv')
+
     pip_requires = os.path.join(root, 'requirements.txt')
     test_requires = os.path.join(root, 'test-requirements.txt')
     py_version = "python%s.%s" % (sys.version_info[0], sys.version_info[1])

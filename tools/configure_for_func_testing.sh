@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,15 +19,16 @@ set -e
 # Control variable used to determine whether to execute this script
 # directly or allow the gate_hook to import.
 IS_GATE=${IS_GATE:-False}
+USE_CONSTRAINT_ENV=${USE_CONSTRAINT_ENV:-True}
 
 
 if [[ "$IS_GATE" != "True" ]] && [[ "$#" -lt 1 ]]; then
     >&2 echo "Usage: $0 /path/to/devstack [-i]
 Configure a host to run Neutron's functional test suite.
 
--i   Install Neutron's package dependencies.  By default, it is assumed
-     that devstack has already been used to deploy neutron to the
-     target host and that package dependencies need not be installed.
+-i  Install Neutron's package dependencies.  By default, it is assumed
+    that devstack has already been used to deploy neutron to the
+    target host and that package dependencies need not be installed.
 
 Warning: This script relies on devstack to perform extensive
 modification to the underlying host.  It is recommended that it be
@@ -49,14 +50,18 @@ done
 
 # Default to environment variables to permit the gate_hook to override
 # when sourcing.
+VENV=${VENV:-dsvm-functional}
 DEVSTACK_PATH=${DEVSTACK_PATH:-$1}
- # The gate should automatically install dependencies.
+PROJECT_NAME=${PROJECT_NAME:-neutron}
+REPO_BASE=${GATE_DEST:-$(cd $(dirname "$0")/../.. && pwd)}
+INSTALL_MYSQL_ONLY=${INSTALL_MYSQL_ONLY:-False}
+# The gate should automatically install dependencies.
 INSTALL_BASE_DEPENDENCIES=${INSTALL_BASE_DEPENDENCIES:-$IS_GATE}
 
 
 if [ ! -f "$DEVSTACK_PATH/stack.sh" ]; then
-  >&2 echo "Unable to find devstack at '$DEVSTACK_PATH'.  Please verify that the specified path points to a valid devstack repo."
-  exit 1
+    >&2 echo "Unable to find devstack at '$DEVSTACK_PATH'.  Please verify that the specified path points to a valid devstack repo."
+    exit 1
 fi
 
 
@@ -64,8 +69,6 @@ set -x
 
 
 function _init {
-    NEUTRON_PATH=${NEUTRON_PATH:-$(cd $(dirname "$0")/.. && pwd)}
-
     # Subsequently-called devstack functions depend on the following variables.
     HOST_IP=127.0.0.1
     FILES=$DEVSTACK_PATH/files
@@ -76,14 +79,17 @@ function _init {
     # Allow the gate to override values set by stackrc.
     DEST=${GATE_DEST:-$DEST}
     STACK_USER=${GATE_STACK_USER:-$STACK_USER}
-}
 
+    GetDistro
+    source $DEVSTACK_PATH/tools/fixup_stuff.sh
+    fixup_uca
+}
 
 function _install_base_deps {
     echo_summary "Installing base dependencies"
 
     INSTALL_TESTONLY_PACKAGES=True
-    PACKAGES=$(get_packages general neutron,q-agt,q-l3)
+    PACKAGES=$(get_packages general,neutron,q-agt,q-l3,openvswitch)
     # Do not install 'python-' prefixed packages other than
     # python-dev*.  Neutron's functional testing relies on deployment
     # to a tox env so there is no point in installing python
@@ -108,7 +114,10 @@ function _install_rpc_backend {
 }
 
 
+# _install_databases [install_pg]
 function _install_databases {
+    local install_pg=${1:-True}
+
     echo_summary "Installing databases"
 
     # Avoid attempting to configure the db if it appears to already
@@ -123,17 +132,17 @@ function _install_databases {
 
     source $DEVSTACK_PATH/lib/database
 
-    disable_service postgresql
     enable_service mysql
     initialize_database_backends
     install_database
     configure_database_mysql
 
-    disable_service mysql
-    enable_service postgresql
-    initialize_database_backends
-    install_database
-    configure_database_postgresql
+    if [[ "$install_pg" == "True" ]]; then
+        enable_service postgresql
+        initialize_database_backends
+        install_database
+        configure_database_postgresql
+    fi
 
     # Set up the 'openstack_citest' user and database in each backend
     tmp_dir=$(mktemp -d)
@@ -149,23 +158,26 @@ FLUSH PRIVILEGES;
 EOF
     /usr/bin/mysql -u root < $tmp_dir/mysql.sql
 
-    cat << EOF > $tmp_dir/postgresql.sql
+    if [[ "$install_pg" == "True" ]]; then
+        cat << EOF > $tmp_dir/postgresql.sql
 CREATE USER openstack_citest WITH CREATEDB LOGIN PASSWORD 'openstack_citest';
 CREATE DATABASE openstack_citest WITH OWNER openstack_citest;
 EOF
 
-    # User/group postgres needs to be given access to tmp_dir
-    setfacl -m g:postgres:rwx $tmp_dir
-    sudo -u postgres /usr/bin/psql --file=$tmp_dir/postgresql.sql
+        # User/group postgres needs to be given access to tmp_dir
+        setfacl -m g:postgres:rwx $tmp_dir
+        sudo -u postgres /usr/bin/psql --file=$tmp_dir/postgresql.sql
+    fi
 }
 
 
 function _install_agent_deps {
     echo_summary "Installing agent dependencies"
 
+    ENABLED_SERVICES=q-agt,q-dhcp,q-l3
+
     source $DEVSTACK_PATH/lib/neutron
 
-    ENABLED_SERVICES=q-agt,q-dhcp,q-l3
     install_neutron_agent_packages
 }
 
@@ -175,10 +187,16 @@ function _install_agent_deps {
 function _install_rootwrap_sudoers {
     echo_summary "Installing rootwrap sudoers file"
 
-    VENV_NAME=${venv:-dsvm-functional}
-    VENV_PATH=$NEUTRON_PATH/.tox/$VENV_NAME
-    ROOTWRAP_SUDOER_CMD="$VENV_PATH/bin/neutron-rootwrap $VENV_PATH/etc/neutron/rootwrap.conf *"
+    PROJECT_VENV=$REPO_BASE/$PROJECT_NAME/.tox/$VENV
+    ROOTWRAP_SUDOER_CMD="$PROJECT_VENV/bin/neutron-rootwrap $PROJECT_VENV/etc/neutron/rootwrap.conf *"
+    ROOTWRAP_DAEMON_SUDOER_CMD="$PROJECT_VENV/bin/neutron-rootwrap-daemon $PROJECT_VENV/etc/neutron/rootwrap.conf"
     TEMPFILE=$(mktemp)
+
+    SECURE_PATH="$PROJECT_VENV/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [[ "$VENV" =~ "dsvm-fullstack" ]]; then
+        SECURE_PATH="$REPO_BASE/$PROJECT_NAME/neutron/tests/fullstack/cmd:$SECURE_PATH"
+    fi
+
     cat << EOF > $TEMPFILE
 # A bug in oslo.rootwrap [1] prevents commands executed with 'ip netns
 # exec' from being automatically qualified with a prefix from
@@ -192,8 +210,9 @@ function _install_rootwrap_sudoers {
 #
 # 1: https://bugs.launchpad.net/oslo.rootwrap/+bug/1417331
 #
-Defaults:$STACK_USER  secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$VENV_PATH/bin"
+Defaults:$STACK_USER  secure_path="$SECURE_PATH"
 $STACK_USER ALL=(root) NOPASSWD: $ROOTWRAP_SUDOER_CMD
+$STACK_USER ALL=(root) NOPASSWD: $ROOTWRAP_DAEMON_SUDOER_CMD
 EOF
     chmod 0440 $TEMPFILE
     sudo chown root:root $TEMPFILE
@@ -211,6 +230,23 @@ function _install_post_devstack {
     _install_databases
     _install_rootwrap_sudoers
 
+    if is_ubuntu; then
+        install_package isc-dhcp-client
+        install_package nmap
+    elif is_fedora; then
+        install_package dhclient
+        install_package nmap-ncat
+    elif is_suse; then
+        install_package dhcp-client
+        # NOTE(armax): no harm in allowing 'other' to read and
+        # execute the script. This is required in fullstack
+        # testing and avoids quite a bit of rootwrap pain
+        sudo chmod o+rx /sbin/dhclient-script
+        install_package ncat
+    else
+        exit_distro_not_supported "installing dhclient and ncat packages"
+    fi
+
     # Installing python-openvswitch from packages is a stop-gap while
     # python-openvswitch remains unavailable from pypi.  This also
     # requires that sitepackages=True be set in tox.ini to allow the
@@ -221,8 +257,21 @@ function _install_post_devstack {
     # supported distros.
     install_package python-openvswitch
 
-    # Configure ovs-vsctl to be reachable via the standard ovsdb port.
-    sudo ovs-vsctl set-manager ptcp:6640:127.0.0.1
+    enable_kernel_bridge_firewall
+}
+
+
+function _configure_iptables_rules {
+    # For linuxbridge agent fullstack tests we need to add special rules to
+    # iptables for connection of agents to rabbitmq:
+    CHAIN_NAME="openstack-INPUT"
+    sudo iptables -n --list $CHAIN_NAME 1> /dev/null 2>&1 || CHAIN_NAME="INPUT"
+    sudo iptables -I $CHAIN_NAME -s 240.0.0.0/8 -p tcp -m tcp -d 240.0.0.0/8 --dport 5672 -j ACCEPT
+}
+
+
+function _enable_ipv6 {
+    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
 }
 
 
@@ -245,5 +294,17 @@ _init
 
 
 if [[ "$IS_GATE" != "True" ]]; then
-    configure_host_for_func_testing
+    if [[ "$INSTALL_MYSQL_ONLY" == "True" ]]; then
+        _install_databases nopg
+    else
+        configure_host_for_func_testing
+    fi
 fi
+
+if [[ "$VENV" =~ "dsvm-fullstack" ]]; then
+    _enable_ipv6
+    _configure_iptables_rules
+    sudo modprobe ip_conntrack_proto_sctp
+fi
+
+echo "Phew, we're done!"

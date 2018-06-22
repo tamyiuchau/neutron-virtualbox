@@ -14,18 +14,21 @@
 #    under the License.
 
 from oslo_config import cfg
+from oslo_log import log as logging
 
-from neutron.agent.common import config as agent_config
-from neutron.agent.l3 import config as l3_config
-from neutron.agent.linux import interface
+from neutron.agent.common import ovs_lib
 from neutron.agent.linux import ip_lib
-from neutron.agent.linux import ovs_lib
 from neutron.common import config
-from neutron.i18n import _LI
-from neutron.openstack.common import log as logging
-
+from neutron.conf.agent import cmd
+from neutron.conf.agent import common as agent_config
+from neutron.conf.agent.l3 import config as l3_config
+from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
 
 LOG = logging.getLogger(__name__)
+
+# Default ovsdb_timeout value for this script.
+# It allows to clean bridges with even thousands of ports.
+CLEANUP_OVSDB_TIMEOUT = 600
 
 
 def setup_conf():
@@ -34,22 +37,24 @@ def setup_conf():
     Use separate setup_conf for the utility because there are many options
     from the main config that do not apply during clean-up.
     """
-    opts = [
-        cfg.BoolOpt('ovs_all_ports',
-                    default=False,
-                    help=_('True to delete all ports on all the OpenvSwitch '
-                           'bridges. False to delete ports created by '
-                           'Neutron on integration and external network '
-                           'bridges.'))
-    ]
 
     conf = cfg.CONF
-    conf.register_cli_opts(opts)
-    conf.register_opts(l3_config.OPTS)
-    conf.register_opts(interface.OPTS)
+    cmd.register_cmd_opts(cmd.ovs_opts, conf)
+    l3_config.register_l3_agent_config_opts(l3_config.OPTS, conf)
     agent_config.register_interface_driver_opts_helper(conf)
-    agent_config.register_use_namespaces_opts_helper(conf)
+    agent_config.register_interface_opts()
+    conf.set_default("ovsdb_timeout", CLEANUP_OVSDB_TIMEOUT, "OVS")
     return conf
+
+
+def get_bridge_deletable_ports(br):
+    """
+    Return a list of OVS Bridge ports, excluding the ports who should not be
+    cleaned. such ports are tagged with the 'skip_cleanup' key in external_ids.
+    """
+    return [port.port_name for port in br.get_vif_ports()
+            if constants.SKIP_CLEANUP not in
+            br.get_port_external_ids(port.port_name)]
 
 
 def collect_neutron_ports(bridges):
@@ -57,7 +62,7 @@ def collect_neutron_ports(bridges):
     ports = []
     for bridge in bridges:
         ovs = ovs_lib.OVSBridge(bridge)
-        ports += [port.port_name for port in ovs.get_vif_ports()]
+        ports += get_bridge_deletable_ports(ovs)
     return ports
 
 
@@ -67,10 +72,10 @@ def delete_neutron_ports(ports):
     Non-internal OVS ports need to be removed manually.
     """
     for port in ports:
-        if ip_lib.device_exists(port):
-            device = ip_lib.IPDevice(port)
+        device = ip_lib.IPDevice(port)
+        if device.exists():
             device.link.delete()
-            LOG.info(_LI("Deleting port: %s"), port)
+            LOG.info("Deleting port: %s", port)
 
 
 def main():
@@ -82,7 +87,10 @@ def main():
     conf = setup_conf()
     conf()
     config.setup_logging()
+    do_main(conf)
 
+
+def do_main(conf):
     configuration_bridges = set([conf.ovs_integration_bridge,
                                  conf.external_network_bridge])
     ovs = ovs_lib.BaseOVS()
@@ -94,17 +102,28 @@ def main():
     else:
         bridges = available_configuration_bridges
 
-    # Collect existing ports created by Neutron on configuration bridges.
-    # After deleting ports from OVS bridges, we cannot determine which
-    # ports were created by Neutron, so port information is collected now.
-    ports = collect_neutron_ports(available_configuration_bridges)
+    try:
+        # The ovs_cleanup method not added to the deprecated vsctl backend
+        for bridge in bridges:
+            LOG.info("Cleaning bridge: %s", bridge)
+            ovs.ovsdb.ovs_cleanup(bridge,
+                                  conf.ovs_all_ports).execute(check_error=True)
+    except AttributeError:
+        # Collect existing ports created by Neutron on configuration bridges.
+        # After deleting ports from OVS bridges, we cannot determine which
+        # ports were created by Neutron, so port information is collected now.
+        ports = collect_neutron_ports(available_configuration_bridges)
 
-    for bridge in bridges:
-        LOG.info(_LI("Cleaning bridge: %s"), bridge)
-        ovs = ovs_lib.OVSBridge(bridge)
-        ovs.delete_ports(all_ports=conf.ovs_all_ports)
+        for bridge in bridges:
+            LOG.info("Cleaning bridge: %s", bridge)
+            ovs = ovs_lib.OVSBridge(bridge)
+            if conf.ovs_all_ports:
+                port_names = ovs.get_port_name_list()
+            else:
+                port_names = get_bridge_deletable_ports(ovs)
+            for port_name in port_names:
+                ovs.delete_port(port_name)
+        # Remove remaining ports created by Neutron (usually veth pair)
+        delete_neutron_ports(ports)
 
-    # Remove remaining ports created by Neutron (usually veth pair)
-    delete_neutron_ports(ports)
-
-    LOG.info(_LI("OVS cleanup completed successfully"))
+    LOG.info("OVS cleanup completed successfully")

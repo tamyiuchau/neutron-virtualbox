@@ -1,4 +1,4 @@
-# Copyright (c) 2014 Openstack Foundation
+# Copyright (c) 2014 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,18 +16,24 @@ import collections
 import itertools
 import uuid
 
+from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import excutils
+from oslo_utils import uuidutils
+from ovsdbapp import api as ovsdb_api
+import six
 
-from neutron.agent.linux import utils
+from neutron.agent.common import utils
 from neutron.agent.ovsdb import api as ovsdb
-from neutron.i18n import _LE
-from neutron.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
 
-class Transaction(ovsdb.Transaction):
+def api_factory(context):
+    return OvsdbVsctl(context)
+
+
+class Transaction(ovsdb_api.Transaction):
     def __init__(self, context, check_error=False, log_errors=True, opts=None):
         self.context = context
         self.check_error = check_error
@@ -61,16 +67,17 @@ class Transaction(ovsdb.Transaction):
             # We log our own errors, so never have utils.execute do it
             return utils.execute(full_args, run_as_root=True,
                                  log_fail_as_error=False).rstrip()
-        except Exception:
+        except Exception as e:
             with excutils.save_and_reraise_exception() as ctxt:
                 if self.log_errors:
-                    LOG.exception(_LE("Unable to execute %(cmd)s."),
-                                  {'cmd': full_args})
+                    LOG.error("Unable to execute %(cmd)s. "
+                              "Exception: %(exception)s",
+                              {'cmd': full_args, 'exception': e})
                 if not self.check_error:
                     ctxt.reraise = False
 
 
-class BaseCommand(ovsdb.Command):
+class BaseCommand(ovsdb_api.Command):
     def __init__(self, context, cmd, opts=None, args=None):
         self.context = context
         self.cmd = cmd
@@ -119,11 +126,13 @@ class DbCommand(BaseCommand):
 
         try:
             json = jsonutils.loads(raw_result)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
             # This shouldn't happen, but if it does and we check_errors
             # log and raise.
             with excutils.save_and_reraise_exception():
-                LOG.exception(_LE("Could not parse: %s"), raw_result)
+                LOG.error("Could not parse: %(raw_result)s. "
+                          "Exception: %(exception)s",
+                          {'raw_result': raw_result, 'exception': e})
 
         headings = json['headings']
         data = json['data']
@@ -131,7 +140,7 @@ class DbCommand(BaseCommand):
         for record in data:
             obj = {}
             for pos, heading in enumerate(headings):
-                obj[heading] = _val_to_py(record[pos])
+                obj[heading] = ovsdb.val_to_py(record[pos])
             results.append(obj)
         self._result = results
 
@@ -143,7 +152,23 @@ class DbGetCommand(DbCommand):
         DbCommand.result.fset(self, val)
         # DbCommand will return [{'column': value}] and we just want value.
         if self._result:
-            self._result = self._result[0].values()[0]
+            self._result = list(self._result[0].values())[0]
+
+
+class DbCreateCommand(BaseCommand):
+    def __init__(self, context, opts=None, args=None):
+        super(DbCreateCommand, self).__init__(context, "create", opts, args)
+        # NOTE(twilson) pre-commit result used for intra-transaction reference
+        self.record_id = "@%s" % uuidutils.generate_uuid()
+        self.opts.append("--id=%s" % self.record_id)
+
+    @property
+    def result(self):
+        return self._result
+
+    @result.setter
+    def result(self, val):
+        self._result = uuid.UUID(val) if val else val
 
 
 class BrExistsCommand(DbCommand):
@@ -156,13 +181,36 @@ class BrExistsCommand(DbCommand):
                                                     log_errors=False)
 
 
-class OvsdbVsctl(ovsdb.API):
-    def transaction(self, check_error=False, log_errors=True, **kwargs):
+class OvsdbVsctl(ovsdb_api.API):
+    def __init__(self, context):
+        super(OvsdbVsctl, self).__init__()
+        self.context = context
+
+    def create_transaction(self, check_error=False, log_errors=True, **kwargs):
         return Transaction(self.context, check_error, log_errors, **kwargs)
 
-    def add_br(self, name, may_exist=True):
+    def add_manager(self, connection_uri):
+        # This will add a new manager without overriding existing ones.
+        conn_uri = 'target="%s"' % connection_uri
+        args = ['create', 'Manager', conn_uri, '--', 'add', 'Open_vSwitch',
+                '.', 'manager_options', '@manager']
+        return BaseCommand(self.context, '--id=@manager', args=args)
+
+    def get_manager(self):
+        return MultiLineCommand(self.context, 'get-manager')
+
+    def remove_manager(self, connection_uri):
+        args = ['get', 'Manager', connection_uri, '--', 'remove',
+                'Open_vSwitch', '.', 'manager_options', '@manager']
+        return BaseCommand(self.context, '--id=@manager', args=args)
+
+    def add_br(self, name, may_exist=True, datapath_type=None):
         opts = ['--may-exist'] if may_exist else None
-        return BaseCommand(self.context, 'add-br', opts, [name])
+        params = [name]
+        if datapath_type:
+            params += ['--', 'set', 'Bridge', name,
+                       'datapath_type=%s' % datapath_type]
+        return BaseCommand(self.context, 'add-br', opts, params)
 
     def del_br(self, name, if_exists=True):
         opts = ['--if-exists'] if if_exists else None
@@ -184,10 +232,29 @@ class OvsdbVsctl(ovsdb.API):
         return BaseCommand(self.context, 'br-get-external-id',
                            args=[name, field])
 
+    def db_create(self, table, **col_values):
+        args = [table]
+        args += _set_colval_args(*col_values.items())
+        return DbCreateCommand(self.context, args=args)
+
+    def db_destroy(self, table, record):
+        args = [table, record]
+        return BaseCommand(self.context, 'destroy', args=args)
+
     def db_set(self, table, record, *col_values):
         args = [table, record]
         args += _set_colval_args(*col_values)
         return BaseCommand(self.context, 'set', args=args)
+
+    def db_add(self, table, record, column, *values):
+        args = [table, record, column]
+        for value in values:
+            if isinstance(value, collections.Mapping):
+                args += ["{}={}".format(ovsdb.py_to_val(k), ovsdb.py_to_val(v))
+                         for k, v in value.items()]
+            else:
+                args.append(ovsdb.py_to_val(value))
+        return BaseCommand(self.context, 'add', args=args)
 
     def db_clear(self, table, record, column):
         return BaseCommand(self.context, 'clear', args=[table, record,
@@ -241,6 +308,18 @@ class OvsdbVsctl(ovsdb.API):
     def list_ports(self, bridge):
         return MultiLineCommand(self.context, 'list-ports', args=[bridge])
 
+    def list_ifaces(self, bridge):
+        return MultiLineCommand(self.context, 'list-ifaces', args=[bridge])
+
+    def db_remove(self, table, record, column, *values, **keyvalues):
+        raise NotImplementedError()
+
+    def db_find_rows(self, table, *conditions, **kwargs):
+        raise NotImplementedError()
+
+    def db_list_rows(self, table, record=None, if_exists=False):
+        raise NotImplementedError()
+
 
 def _set_colval_args(*col_values):
     args = []
@@ -253,32 +332,14 @@ def _set_colval_args(*col_values):
             col, op, val = entry
         if isinstance(val, collections.Mapping):
             args += ["%s:%s%s%s" % (
-                col, k, op, _py_to_val(v)) for k, v in val.items()]
+                col, k, op, ovsdb.py_to_val(v)) for k, v in val.items()]
         elif (isinstance(val, collections.Sequence)
-                and not isinstance(val, basestring)):
-            args.append("%s%s%s" % (col, op, ",".join(map(_py_to_val, val))))
+                and not isinstance(val, six.string_types)):
+            if len(val) == 0:
+                args.append("%s%s%s" % (col, op, "[]"))
+            else:
+                args.append(
+                    "%s%s%s" % (col, op, ",".join(map(ovsdb.py_to_val, val))))
         else:
-            args.append("%s%s%s" % (col, op, _py_to_val(val)))
+            args.append("%s%s%s" % (col, op, ovsdb.py_to_val(val)))
     return args
-
-
-def _val_to_py(val):
-    """Convert a json ovsdb return value to native python object"""
-    if isinstance(val, collections.Sequence) and len(val) == 2:
-        if val[0] == "uuid":
-            return uuid.UUID(val[1])
-        elif val[0] == "set":
-            return [_val_to_py(x) for x in val[1]]
-        elif val[0] == "map":
-            return {_val_to_py(x): _val_to_py(y) for x, y in val[1]}
-    return val
-
-
-def _py_to_val(pyval):
-    """Convert python value to ovs-vsctl value argument"""
-    if isinstance(pyval, bool):
-        return 'true' if pyval is True else 'false'
-    elif pyval == '':
-        return '""'
-    else:
-        return pyval

@@ -17,37 +17,38 @@
 import sys
 
 from oslo_config import cfg
+from oslo_service import service
 
-from neutron.agent.common import config
-from neutron.agent.l3 import config as l3_config
-from neutron.agent.l3 import ha
-from neutron.agent.linux import external_process
-from neutron.agent.linux import interface
-from neutron.agent.metadata import driver as metadata_driver
 from neutron.common import config as common_config
 from neutron.common import topics
-from neutron.openstack.common import service
+from neutron.conf.agent import common as config
+from neutron.conf.agent.l3 import config as l3_config
+from neutron.conf.agent.l3 import ha as ha_conf
+from neutron.conf.agent.metadata import config as meta_conf
 from neutron import service as neutron_service
 
 
 def register_opts(conf):
-    conf.register_opts(l3_config.OPTS)
-    conf.register_opts(metadata_driver.MetadataDriver.OPTS)
-    conf.register_opts(ha.OPTS)
+    l3_config.register_l3_agent_config_opts(l3_config.OPTS, conf)
+    ha_conf.register_l3_agent_ha_opts(conf)
+    meta_conf.register_meta_conf_opts(meta_conf.SHARED_OPTS, conf)
     config.register_interface_driver_opts_helper(conf)
-    config.register_use_namespaces_opts_helper(conf)
     config.register_agent_state_opts_helper(conf)
-    conf.register_opts(interface.OPTS)
-    conf.register_opts(external_process.OPTS)
+    config.register_interface_opts(conf)
+    config.register_external_process_opts(conf)
+    config.register_pddriver_opts(conf)
+    config.register_ra_opts(conf)
+    config.register_availability_zone_opts_helper(conf)
 
 
 def main(manager='neutron.agent.l3.agent.L3NATAgentWithStateReport'):
     register_opts(cfg.CONF)
     common_config.init(sys.argv[1:])
     config.setup_logging()
+    config.setup_privsep()
     server = neutron_service.Service.create(
         binary='neutron-l3-agent',
         topic=topics.L3_AGENT,
         report_interval=cfg.CONF.AGENT.report_interval,
         manager=manager)
-    service.launch(server).wait()
+    service.launch(cfg.CONF, server).wait()

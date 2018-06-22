@@ -17,13 +17,25 @@ import os
 
 from oslo_config import cfg
 
-from neutron.agent.common import config
+from neutron.agent.linux import utils
+from neutron.conf.agent import common as config
 from neutron.tests import base
+from neutron.tests.common import base as common_base
+from neutron.tests.common import helpers
 
-SUDO_CMD = 'sudo -n'
+# This is the directory from which infra fetches log files for functional tests
+DEFAULT_LOG_DIR = os.path.join(helpers.get_test_log_path(),
+                               'dsvm-functional-logs')
 
 
-class BaseSudoTestCase(base.BaseTestCase):
+class BaseLoggingTestCase(base.BaseTestCase):
+    def setUp(self):
+        super(BaseLoggingTestCase, self).setUp()
+        base.setup_test_logging(
+            cfg.CONF, DEFAULT_LOG_DIR, "%s.txt" % self.id())
+
+
+class BaseSudoTestCase(BaseLoggingTestCase):
     """
     Base class for tests requiring invocation of commands via a root helper.
 
@@ -46,13 +58,16 @@ class BaseSudoTestCase(base.BaseTestCase):
 
     def setUp(self):
         super(BaseSudoTestCase, self).setUp()
-
         if not base.bool_from_env('OS_SUDO_TESTING'):
             self.skipTest('Testing with sudo is not enabled')
+        self.setup_rootwrap()
+        config.setup_privsep()
 
-        self.fail_on_missing_deps = (
-            base.bool_from_env('OS_FAIL_ON_MISSING_DEPS'))
-
-        config.register_root_helper(cfg.CONF)
-        self.config(group='AGENT',
-                    root_helper=os.environ.get('OS_ROOTWRAP_CMD', SUDO_CMD))
+    @common_base.no_skip_on_missing_deps
+    def check_command(self, cmd, error_text, skip_msg, run_as_root=False):
+        try:
+            utils.execute(cmd, run_as_root=run_as_root)
+        except RuntimeError as e:
+            if error_text in str(e):
+                self.skipTest(skip_msg)
+            raise

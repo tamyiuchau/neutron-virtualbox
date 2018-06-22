@@ -13,14 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from neutron_lib.plugins import directory
+from oslo_log import helpers as log_helpers
+from oslo_log import log as logging
 import oslo_messaging
 
 from neutron.common import constants
-from neutron.common import log
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
-from neutron import manager
-from neutron.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
@@ -30,34 +30,47 @@ class DVRServerRpcApi(object):
 
     This class implements the client side of an rpc interface.  The server side
     can be found below: DVRServerRpcCallback.  For more information on changing
-    rpc interfaces, see doc/source/devref/rpc_api.rst.
+    rpc interfaces, see doc/source/contributor/internals/rpc_api.rst.
     """
+    # 1.0 Initial Version
+    # 1.1 Support for passing 'fixed_ips' in get_subnet_for_dvr function.
+    #     Passing 'subnet" will be deprecated in the next release.
 
     def __init__(self, topic):
         target = oslo_messaging.Target(topic=topic, version='1.0',
                                        namespace=constants.RPC_NAMESPACE_DVR)
         self.client = n_rpc.get_client(target)
 
-    @log.log
+    @log_helpers.log_method_call
     def get_dvr_mac_address_by_host(self, context, host):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'get_dvr_mac_address_by_host', host=host)
 
-    @log.log
+    @log_helpers.log_method_call
     def get_dvr_mac_address_list(self, context):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'get_dvr_mac_address_list')
 
-    @log.log
+    @log_helpers.log_method_call
     def get_ports_on_host_by_subnet(self, context, host, subnet):
+        """Get DVR serviced ports on given host and subnet."""
+
         cctxt = self.client.prepare()
         return cctxt.call(context, 'get_ports_on_host_by_subnet',
                           host=host, subnet=subnet)
 
-    @log.log
-    def get_subnet_for_dvr(self, context, subnet):
+    @log_helpers.log_method_call
+    def get_network_info_for_id(self, context, network_id):
+        """Get network info for DVR router ports."""
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'get_subnet_for_dvr', subnet=subnet)
+        return cctxt.call(context, 'get_network_info_for_id',
+                          network_id=network_id)
+
+    @log_helpers.log_method_call
+    def get_subnet_for_dvr(self, context, subnet, fixed_ips):
+        cctxt = self.client.prepare()
+        return cctxt.call(
+            context, 'get_subnet_for_dvr', subnet=subnet, fixed_ips=fixed_ips)
 
 
 class DVRServerRpcCallback(object):
@@ -65,19 +78,21 @@ class DVRServerRpcCallback(object):
 
     This class implements the server side of an rpc interface.  The client side
     can be found above: DVRServerRpcApi.  For more information on changing rpc
-    interfaces, see doc/source/devref/rpc_api.rst.
+    interfaces, see doc/source/contributor/internals/rpc_api.rst.
     """
 
     # History
     #   1.0 Initial version
+    #   1.1 Support for passing the 'fixed_ips" in get_subnet_for_dvr.
+    #       Passing subnet will be deprecated in the next release.
 
-    target = oslo_messaging.Target(version='1.0',
+    target = oslo_messaging.Target(version='1.1',
                                    namespace=constants.RPC_NAMESPACE_DVR)
 
     @property
     def plugin(self):
         if not getattr(self, '_plugin', None):
-            self._plugin = manager.NeutronManager.get_plugin()
+            self._plugin = directory.get_plugin()
         return self._plugin
 
     def get_dvr_mac_address_list(self, context):
@@ -89,15 +104,26 @@ class DVRServerRpcCallback(object):
         return self.plugin.get_dvr_mac_address_by_host(context, host)
 
     def get_ports_on_host_by_subnet(self, context, **kwargs):
+        """Get DVR serviced ports for given host and subnet."""
+
         host = kwargs.get('host')
         subnet = kwargs.get('subnet')
         LOG.debug("DVR Agent requests list of VM ports on host %s", host)
         return self.plugin.get_ports_on_host_by_subnet(context,
             host, subnet)
 
+    def get_network_info_for_id(self, context, **kwargs):
+        """Get network info for DVR port."""
+        network_id = kwargs.get('network_id')
+        LOG.debug("DVR Agent requests network info for id %s", network_id)
+        net_filter = {'id': [network_id]}
+        return self.plugin.get_networks(context, filters=net_filter)
+
     def get_subnet_for_dvr(self, context, **kwargs):
+        fixed_ips = kwargs.get('fixed_ips')
         subnet = kwargs.get('subnet')
-        return self.plugin.get_subnet_for_dvr(context, subnet)
+        return self.plugin.get_subnet_for_dvr(
+            context, subnet, fixed_ips=fixed_ips)
 
 
 class DVRAgentRpcApiMixin(object):

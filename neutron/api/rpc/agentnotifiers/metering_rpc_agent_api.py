@@ -12,15 +12,16 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from neutron_lib import constants
+from neutron_lib.plugins import constants as plugin_constants
+from neutron_lib.plugins import directory
+from oslo_log import log as logging
 import oslo_messaging
 
-from neutron.common import constants
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron.common import utils
-from neutron import manager
-from neutron.openstack.common import log as logging
-from neutron.plugins.common import constants as service_constants
+from neutron.db import agentschedulers_db
 
 LOG = logging.getLogger(__name__)
 
@@ -36,14 +37,14 @@ class MeteringAgentNotifyAPI(object):
     def _agent_notification(self, context, method, routers):
         """Notify l3 metering agents hosted by l3 agent hosts."""
         adminContext = context if context.is_admin else context.elevated()
-        plugin = manager.NeutronManager.get_service_plugins().get(
-            service_constants.L3_ROUTER_NAT)
+        plugin = directory.get_plugin(plugin_constants.L3)
 
         l3_routers = {}
+        state = agentschedulers_db.get_admin_state_up_filter()
         for router in routers:
             l3_agents = plugin.get_l3_agents_hosting_routers(
                 adminContext, [router['id']],
-                admin_state_up=True,
+                admin_state_up=state,
                 active=True)
             for l3_agent in l3_agents:
                 LOG.debug('Notify metering agent at %(topic)s.%(host)s '
@@ -56,7 +57,7 @@ class MeteringAgentNotifyAPI(object):
                 l3_router.append(router)
                 l3_routers[l3_agent.host] = l3_router
 
-        for host, routers in l3_routers.iteritems():
+        for host, routers in l3_routers.items():
             cctxt = self.client.prepare(server=host)
             cctxt.cast(context, method, routers=routers)
 
@@ -69,10 +70,17 @@ class MeteringAgentNotifyAPI(object):
         cctxt = self.client.prepare(fanout=True)
         cctxt.cast(context, method, router_id=router_id)
 
+    def _notification_host(self, context, method, host, **kwargs):
+        """Notify the agent that is hosting the router."""
+        LOG.debug('Notify agent at %(host)s the message '
+                  '%(method)s', {'host': host,
+                                 'method': method})
+        cctxt = self.client.prepare(server=host)
+        cctxt.cast(context, method, **kwargs)
+
     def _notification(self, context, method, routers):
         """Notify all the agents that are hosting the routers."""
-        plugin = manager.NeutronManager.get_service_plugins().get(
-            service_constants.L3_ROUTER_NAT)
+        plugin = directory.get_plugin(plugin_constants.L3)
         if utils.is_extension_supported(
             plugin, constants.L3_AGENT_SCHEDULER_EXT_ALIAS):
             self._agent_notification(context, method, routers)
@@ -90,8 +98,19 @@ class MeteringAgentNotifyAPI(object):
     def update_metering_label_rules(self, context, routers):
         self._notification(context, 'update_metering_label_rules', routers)
 
+    def add_metering_label_rule(self, context, routers):
+        self._notification(context, 'add_metering_label_rule', routers)
+
+    def remove_metering_label_rule(self, context, routers):
+        self._notification(context, 'remove_metering_label_rule', routers)
+
     def add_metering_label(self, context, routers):
         self._notification(context, 'add_metering_label', routers)
 
     def remove_metering_label(self, context, routers):
         self._notification(context, 'remove_metering_label', routers)
+
+    def routers_updated_on_host(self, context, router_ids, host):
+        """Notify router updates to specific hosts hosting DVR routers."""
+        self._notification_host(context, 'routers_updated', host,
+                                routers=router_ids)

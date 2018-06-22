@@ -25,7 +25,8 @@ rule_direction_enum = sa.Enum('ingress', 'egress',
 def upgrade():
     op.create_table(
         'securitygroups',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True),
+        sa.Column('tenant_id', sa.String(length=255), nullable=True,
+                  index=True),
         sa.Column('id', sa.String(length=36), nullable=False),
         sa.Column('name', sa.String(length=255), nullable=True),
         sa.Column('description', sa.String(length=255), nullable=True),
@@ -33,7 +34,8 @@ def upgrade():
 
     op.create_table(
         'securitygrouprules',
-        sa.Column('tenant_id', sa.String(length=255), nullable=True),
+        sa.Column('tenant_id', sa.String(length=255), nullable=True,
+                  index=True),
         sa.Column('id', sa.String(length=36), nullable=False),
         sa.Column('security_group_id', sa.String(length=36), nullable=False),
         sa.Column('remote_group_id', sa.String(length=36), nullable=True),
@@ -57,9 +59,11 @@ def upgrade():
         sa.ForeignKeyConstraint(['security_group_id'], ['securitygroups.id']),
         sa.PrimaryKeyConstraint('port_id', 'security_group_id'))
 
-
-def downgrade():
-    op.drop_table('securitygroupportbindings')
-    op.drop_table('securitygrouprules')
-    op.drop_table('securitygroups')
-    rule_direction_enum.drop(op.get_bind(), checkfirst=False)
+    op.create_table(
+        'default_security_group',
+        sa.Column('tenant_id', sa.String(length=255), nullable=False),
+        sa.Column('security_group_id', sa.String(length=36), nullable=False),
+        sa.PrimaryKeyConstraint('tenant_id'),
+        sa.ForeignKeyConstraint(['security_group_id'],
+                                ['securitygroups.id'],
+                                ondelete="CASCADE"))

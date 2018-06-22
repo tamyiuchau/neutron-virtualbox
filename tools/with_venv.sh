@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2011 OpenStack Foundation.
 # All Rights Reserved.
 #
@@ -14,6 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-TOOLS=`dirname $0`
-VENV=$TOOLS/../.venv
+tools_path=${tools_path:-$(dirname $0)}
+venv_path=${venv_path:-${tools_path}}
+venv_dir=${venv_name:-/../.venv}
+TOOLS=${tools_path}
+VENV=${venv:-${venv_path}/${venv_dir}}
 source $VENV/bin/activate && "$@"

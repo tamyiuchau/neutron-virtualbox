@@ -18,24 +18,29 @@
 
 """Implements iptables rules using linux utilities."""
 
+import collections
 import contextlib
+import difflib
 import os
 import re
 import sys
 
+from neutron_lib.utils import runtime
 from oslo_concurrency import lockutils
 from oslo_config import cfg
+from oslo_log import log as logging
 from oslo_utils import excutils
 
-from neutron.agent.common import config
+from neutron._i18n import _
+from neutron.agent.linux import ip_lib
 from neutron.agent.linux import iptables_comments as ic
 from neutron.agent.linux import utils as linux_utils
 from neutron.common import exceptions as n_exc
-from neutron.common import utils
-from neutron.i18n import _LE, _LW
-from neutron.openstack.common import log as logging
+from neutron.conf.agent import common as config
 
 LOG = logging.getLogger(__name__)
+
+config.register_iptables_opts(cfg.CONF)
 
 
 # NOTE(vish): Iptables supports chain names of up to 28 characters,  and we
@@ -57,11 +62,27 @@ MAX_CHAIN_LEN_NOWRAP = 28
 # a failure during iptables-restore
 IPTABLES_ERROR_LINES_OF_CONTEXT = 5
 
+# RESOURCE_PROBLEM in include/xtables.h
+XTABLES_RESOURCE_PROBLEM_CODE = 4
+
+# xlock wait interval, in microseconds
+XLOCK_WAIT_INTERVAL = 200000
+
 
 def comment_rule(rule, comment):
     if not cfg.CONF.AGENT.comment_iptables_rules or not comment:
         return rule
-    return '%s -m comment --comment "%s"' % (rule, comment)
+    # iptables-save outputs the comment before the jump so we need to match
+    # that order so _find_last_entry works
+    comment = '-m comment --comment "%s"' % comment
+    if rule.startswith('-j'):
+        # this is a jump only rule so we just put the comment first
+        return '%s %s' % (comment, rule)
+    try:
+        jpos = rule.index(' -j ')
+        return ' '.join((rule[:jpos], comment, rule[jpos + 1:]))
+    except ValueError:
+        return '%s %s' % (rule, comment)
 
 
 def get_chain_name(chain_name, wrap=True):
@@ -103,7 +124,10 @@ class IptablesRule(object):
             chain = '%s-%s' % (self.wrap_name, self.chain)
         else:
             chain = self.chain
-        return comment_rule('-A %s %s' % (chain, self.rule), self.comment)
+        rule = '-A %s %s' % (chain, self.rule)
+        # If self.rule is '' the above will cause a trailing space, which
+        # could cause us to not match on save/restore, so strip it now.
+        return comment_rule(rule.strip(), self.comment)
 
 
 class IptablesTable(object):
@@ -165,23 +189,18 @@ class IptablesTable(object):
             # so we keep a list of them to be iterated over in apply()
             self.remove_chains.add(name)
 
-            # first, add rules to remove that have a matching chain name
-            self.remove_rules += [r for r in self.rules if r.chain == name]
-
-        # next, remove rules from list that have a matching chain name
-        self.rules = [r for r in self.rules if r.chain != name]
-
-        if not wrap:
+            # Add rules to remove that have a matching chain name or
+            # a matching jump chain
             jump_snippet = '-j %s' % name
-            # next, add rules to remove that have a matching jump chain
-            self.remove_rules += [r for r in self.rules
-                                  if jump_snippet in r.rule]
+            self.remove_rules += [str(r) for r in self.rules
+                                  if r.chain == name or jump_snippet in r.rule]
         else:
             jump_snippet = '-j %s-%s' % (self.wrap_name, name)
 
-        # finally, remove rules from list that have a matching jump chain
+        # Remove rules from list that have a matching chain name or
+        # a matching jump chain
         self.rules = [r for r in self.rules
-                      if jump_snippet not in r.rule]
+                      if r.chain != name and jump_snippet not in r.rule]
 
     def add_rule(self, chain, rule, wrap=True, top=False, tag=None,
                  comment=None):
@@ -230,14 +249,14 @@ class IptablesTable(object):
                                            self.wrap_name,
                                            comment=comment))
             if not wrap:
-                self.remove_rules.append(IptablesRule(chain, rule, wrap, top,
-                                                      self.wrap_name,
-                                                      comment=comment))
+                self.remove_rules.append(str(IptablesRule(chain, rule, wrap,
+                                                          top, self.wrap_name,
+                                                          comment=comment)))
         except ValueError:
-            LOG.warn(_LW('Tried to remove rule that was not there:'
-                         ' %(chain)r %(rule)r %(wrap)r %(top)r'),
-                     {'chain': chain, 'rule': rule,
-                      'top': top, 'wrap': wrap})
+            LOG.warning('Tried to remove rule that was not there:'
+                        ' %(chain)r %(rule)r %(wrap)r %(top)r',
+                        {'chain': chain, 'rule': rule,
+                         'top': top, 'wrap': wrap})
 
     def _get_chain_rules(self, chain, wrap):
         chain = get_chain_name(chain, wrap)
@@ -281,6 +300,10 @@ class IptablesManager(object):
 
     """
 
+    # Flag to denote we've already tried and used -w successfully, so don't
+    # run iptables-restore without it.
+    use_table_lock = False
+
     def __init__(self, _execute=None, state_less=False, use_ipv6=False,
                  namespace=None, binary_name=binary_name):
         if _execute:
@@ -288,7 +311,6 @@ class IptablesManager(object):
         else:
             self.execute = linux_utils.execute
 
-        config.register_iptables_opts(cfg.CONF)
         self.use_ipv6 = use_ipv6
         self.namespace = namespace
         self.iptables_apply_deferred = False
@@ -311,62 +333,84 @@ class IptablesManager(object):
             tables['filter'].add_rule('neutron-filter-top', '-j $local',
                                       wrap=False)
 
+        self.ipv4.update({'raw': IptablesTable(binary_name=self.wrap_name)})
+        self.ipv6.update({'raw': IptablesTable(binary_name=self.wrap_name)})
+
         # Wrap the built-in chains
         builtin_chains = {4: {'filter': ['INPUT', 'OUTPUT', 'FORWARD']},
                           6: {'filter': ['INPUT', 'OUTPUT', 'FORWARD']}}
+        builtin_chains[4].update({'raw': ['PREROUTING', 'OUTPUT']})
+        builtin_chains[6].update({'raw': ['PREROUTING', 'OUTPUT']})
+        self._configure_builtin_chains(builtin_chains)
 
         if not state_less:
-            self.ipv4.update(
-                {'mangle': IptablesTable(binary_name=self.wrap_name)})
-            builtin_chains[4].update(
-                {'mangle': ['PREROUTING', 'INPUT', 'FORWARD', 'OUTPUT',
-                            'POSTROUTING']})
-            self.ipv4.update(
-                {'nat': IptablesTable(binary_name=self.wrap_name)})
-            builtin_chains[4].update({'nat': ['PREROUTING',
-                                      'OUTPUT', 'POSTROUTING']})
-            self.ipv4.update(
-                {'raw': IptablesTable(binary_name=self.wrap_name)})
-            builtin_chains[4].update({'raw': ['PREROUTING',
-                                      'OUTPUT']})
+            self.initialize_mangle_table()
+            self.initialize_nat_table()
 
+    def initialize_mangle_table(self):
+        self.ipv4.update(
+            {'mangle': IptablesTable(binary_name=self.wrap_name)})
+        self.ipv6.update(
+            {'mangle': IptablesTable(binary_name=self.wrap_name)})
+
+        builtin_chains = {
+            4: {'mangle': ['PREROUTING', 'INPUT', 'FORWARD', 'OUTPUT',
+                           'POSTROUTING']},
+            6: {'mangle': ['PREROUTING', 'INPUT', 'FORWARD', 'OUTPUT',
+                           'POSTROUTING']}}
+        self._configure_builtin_chains(builtin_chains)
+
+        # Add a mark chain to mangle PREROUTING chain. It is used to
+        # identify ingress packets from a certain interface.
+        self.ipv4['mangle'].add_chain('mark')
+        self.ipv4['mangle'].add_rule('PREROUTING', '-j $mark')
+
+    def initialize_nat_table(self):
+        self.ipv4.update(
+            {'nat': IptablesTable(binary_name=self.wrap_name)})
+
+        builtin_chains = {
+            4: {'nat': ['PREROUTING', 'OUTPUT', 'POSTROUTING']}}
+        self._configure_builtin_chains(builtin_chains)
+
+        # Add a neutron-postrouting-bottom chain. It's intended to be
+        # shared among the various neutron components. We set it as the
+        # last chain of POSTROUTING chain.
+        self.ipv4['nat'].add_chain('neutron-postrouting-bottom', wrap=False)
+        self.ipv4['nat'].add_rule(
+            'POSTROUTING', '-j neutron-postrouting-bottom', wrap=False)
+
+        # We add a snat chain to the shared neutron-postrouting-bottom
+        # chain so that it's applied last.
+        self.ipv4['nat'].add_chain('snat')
+        self.ipv4['nat'].add_rule('neutron-postrouting-bottom',
+                                  '-j $snat', wrap=False,
+                                  comment=ic.SNAT_OUT)
+
+        # And then we add a float-snat chain and jump to first thing in
+        # the snat chain.
+        self.ipv4['nat'].add_chain('float-snat')
+        self.ipv4['nat'].add_rule('snat', '-j $float-snat')
+
+    def _configure_builtin_chains(self, builtin_chains):
         for ip_version in builtin_chains:
             if ip_version == 4:
                 tables = self.ipv4
             elif ip_version == 6:
                 tables = self.ipv6
 
-            for table, chains in builtin_chains[ip_version].iteritems():
+            for table, chains in builtin_chains[ip_version].items():
                 for chain in chains:
                     tables[table].add_chain(chain)
                     tables[table].add_rule(chain, '-j $%s' %
                                            (chain), wrap=False)
 
-        if not state_less:
-            # Add a neutron-postrouting-bottom chain. It's intended to be
-            # shared among the various neutron components. We set it as the
-            # last chain of POSTROUTING chain.
-            self.ipv4['nat'].add_chain('neutron-postrouting-bottom',
-                                       wrap=False)
-            self.ipv4['nat'].add_rule('POSTROUTING',
-                                      '-j neutron-postrouting-bottom',
-                                      wrap=False)
-
-            # We add a snat chain to the shared neutron-postrouting-bottom
-            # chain so that it's applied last.
-            self.ipv4['nat'].add_chain('snat')
-            self.ipv4['nat'].add_rule('neutron-postrouting-bottom',
-                                      '-j $snat', wrap=False,
-                                      comment=ic.SNAT_OUT)
-
-            # And then we add a float-snat chain and jump to first thing in
-            # the snat chain.
-            self.ipv4['nat'].add_chain('float-snat')
-            self.ipv4['nat'].add_rule('snat', '-j $float-snat')
+    def get_tables(self, ip_version):
+        return {4: self.ipv4, 6: self.ipv6}[ip_version]
 
     def get_chain(self, table, chain, ip_version=4, wrap=True):
         try:
-            requested_table = {4: self.ipv4, 6: self.ipv6}[ip_version][table]
+            requested_table = self.get_tables(ip_version)[table]
         except KeyError:
             return []
         return requested_table._get_chain_rules(chain, wrap)
@@ -383,9 +427,13 @@ class IptablesManager(object):
         finally:
             try:
                 self.defer_apply_off()
+            except n_exc.IpTablesApplyException:
+                # already in the format we want, just reraise
+                raise
             except Exception:
-                raise n_exc.IpTablesApplyException('Failure applying ip '
-                                                   'tables rules')
+                msg = _('Failure applying iptables rules')
+                LOG.exception(msg)
+                raise n_exc.IpTablesApplyException(msg)
 
     def defer_apply_on(self):
         self.iptables_apply_deferred = True
@@ -398,85 +446,172 @@ class IptablesManager(object):
         if self.iptables_apply_deferred:
             return
 
-        self._apply()
+        return self._apply()
 
     def _apply(self):
         lock_name = 'iptables'
         if self.namespace:
             lock_name += '-' + self.namespace
 
+        # NOTE(ihrachys) we may get rid of the lock once all supported
+        # platforms get iptables with 999eaa241212d3952ddff39a99d0d55a74e3639e
+        # ("iptables-restore: support acquiring the lock.")
+        with lockutils.lock(lock_name, runtime.SYNCHRONIZED_PREFIX, True):
+            first = self._apply_synchronized()
+            if not cfg.CONF.AGENT.debug_iptables_rules:
+                return first
+            second = self._apply_synchronized()
+            if second:
+                msg = (_("IPTables Rules did not converge. Diff: %s") %
+                       '\n'.join(second))
+                LOG.error(msg)
+                raise n_exc.IpTablesApplyException(msg)
+            return first
+
+    def get_rules_for_table(self, table):
+        """Runs iptables-save on a table and returns the results."""
+        args = ['iptables-save', '-t', table]
+        if self.namespace:
+            args = ['ip', 'netns', 'exec', self.namespace] + args
+        return self.execute(args, run_as_root=True).split('\n')
+
+    @property
+    def xlock_wait_time(self):
+        # give agent some time to report back to server
+        return str(int(cfg.CONF.AGENT.report_interval / 3.0))
+
+    def _do_run_restore(self, args, commands, lock=False):
+        args = args[:]
+        if lock:
+            args += ['-w', self.xlock_wait_time, '-W', XLOCK_WAIT_INTERVAL]
         try:
-            with lockutils.lock(lock_name, utils.SYNCHRONIZED_PREFIX, True):
-                LOG.debug('Got semaphore / lock "%s"', lock_name)
-                return self._apply_synchronized()
-        finally:
-            LOG.debug('Semaphore / lock released "%s"', lock_name)
+            kwargs = {} if lock else {'log_fail_as_error': False}
+            self.execute(args, process_input='\n'.join(commands),
+                         run_as_root=True, **kwargs)
+        except RuntimeError as error:
+            return error
+
+    def _run_restore(self, args, commands):
+        # If we've already tried and used -w successfully, don't
+        # run iptables-restore without it.
+        if self.use_table_lock:
+            return self._do_run_restore(args, commands, lock=True)
+
+        err = self._do_run_restore(args, commands)
+        if (isinstance(err, linux_utils.ProcessExecutionError) and
+            err.returncode == XTABLES_RESOURCE_PROBLEM_CODE):
+            # maybe we run on a platform that includes iptables commit
+            # 999eaa241212d3952ddff39a99d0d55a74e3639e (for example, latest
+            # RHEL) and failed because of xlock acquired by another
+            # iptables process running in parallel. Try to use -w to
+            # acquire xlock.
+            err = self._do_run_restore(args, commands, lock=True)
+            if not err:
+                self.__class__.use_table_lock = True
+        return err
+
+    def _log_restore_err(self, err, commands):
+        try:
+            line_no = int(re.search(
+                'iptables-restore: line ([0-9]+?) failed',
+                str(err)).group(1))
+            context = IPTABLES_ERROR_LINES_OF_CONTEXT
+            log_start = max(0, line_no - context)
+            log_end = line_no + context
+        except AttributeError:
+            # line error wasn't found, print all lines instead
+            log_start = 0
+            log_end = len(commands)
+        log_lines = ('%7d. %s' % (idx, l)
+                     for idx, l in enumerate(
+                         commands[log_start:log_end],
+                         log_start + 1)
+                     )
+        LOG.error("IPTablesManager.apply failed to apply the "
+                  "following set of iptables rules:\n%s",
+                  '\n'.join(log_lines))
 
     def _apply_synchronized(self):
         """Apply the current in-memory set of iptables rules.
 
-        This will blow away any rules left over from previous runs of the
-        same component of Nova, and replace them with our current set of
-        rules. This happens atomically, thanks to iptables-restore.
+        This will create a diff between the rules from the previous runs
+        and replace them with the current set of rules.
+        This happens atomically, thanks to iptables-restore.
 
+        Returns a list of the changes that were sent to iptables-save.
         """
         s = [('iptables', self.ipv4)]
         if self.use_ipv6:
             s += [('ip6tables', self.ipv6)]
-
+        all_commands = []  # variable to keep track all commands for return val
         for cmd, tables in s:
-            args = ['%s-save' % (cmd,), '-c']
-            if self.namespace:
-                args = ['ip', 'netns', 'exec', self.namespace] + args
-            all_tables = self.execute(args, run_as_root=True)
-            all_lines = all_tables.split('\n')
-            # Traverse tables in sorted order for predictable dump output
-            for table_name in sorted(tables):
-                table = tables[table_name]
-                start, end = self._find_table(all_lines, table_name)
-                all_lines[start:end] = self._modify_rules(
-                    all_lines[start:end], table, table_name)
-
-            args = ['%s-restore' % (cmd,), '-c']
+            args = ['%s-save' % (cmd,)]
             if self.namespace:
                 args = ['ip', 'netns', 'exec', self.namespace] + args
             try:
-                self.execute(args, process_input='\n'.join(all_lines),
-                             run_as_root=True)
-            except RuntimeError as r_error:
-                with excutils.save_and_reraise_exception():
-                    try:
-                        line_no = int(re.search(
-                            'iptables-restore: line ([0-9]+?) failed',
-                            str(r_error)).group(1))
-                        context = IPTABLES_ERROR_LINES_OF_CONTEXT
-                        log_start = max(0, line_no - context)
-                        log_end = line_no + context
-                    except AttributeError:
-                        # line error wasn't found, print all lines instead
-                        log_start = 0
-                        log_end = len(all_lines)
-                    log_lines = ('%7d. %s' % (idx, l)
-                                 for idx, l in enumerate(
-                                     all_lines[log_start:log_end],
-                                     log_start + 1)
-                                 )
-                    LOG.error(_LE("IPTablesManager.apply failed to apply the "
-                                  "following set of iptables rules:\n%s"),
-                              '\n'.join(log_lines))
-        LOG.debug("IPTablesManager.apply completed with success")
+                save_output = self.execute(args, run_as_root=True)
+            except RuntimeError:
+                # We could be racing with a cron job deleting namespaces.
+                # It is useless to try to apply iptables rules over and
+                # over again in a endless loop if the namespace does not
+                # exist.
+                with excutils.save_and_reraise_exception() as ctx:
+                    if (self.namespace and not
+                            ip_lib.network_namespace_exists(self.namespace)):
+                        ctx.reraise = False
+                        LOG.error("Namespace %s was deleted during IPTables "
+                                  "operations.", self.namespace)
+                        return []
+            all_lines = save_output.split('\n')
+            commands = []
+            # Traverse tables in sorted order for predictable dump output
+            for table_name in sorted(tables):
+                table = tables[table_name]
+                # isolate the lines of the table we are modifying
+                start, end = self._find_table(all_lines, table_name)
+                old_rules = all_lines[start:end]
+                # generate the new table state we want
+                new_rules = self._modify_rules(old_rules, table, table_name)
+                # generate the iptables commands to get between the old state
+                # and the new state
+                changes = _generate_path_between_rules(old_rules, new_rules)
+                if changes:
+                    # if there are changes to the table, we put on the header
+                    # and footer that iptables-save needs
+                    commands += (['# Generated by iptables_manager'] +
+                                 ['*%s' % table_name] + changes +
+                                 ['COMMIT', '# Completed by iptables_manager'])
+            if not commands:
+                continue
+            all_commands += commands
+
+            # always end with a new line
+            commands.append('')
+
+            args = ['%s-restore' % (cmd,), '-n']
+            if self.namespace:
+                args = ['ip', 'netns', 'exec', self.namespace] + args
+
+            err = self._run_restore(args, commands)
+            if err:
+                self._log_restore_err(err, commands)
+                raise err
+
+        LOG.debug("IPTablesManager.apply completed with success. %d iptables "
+                  "commands were issued", len(all_commands))
+        return all_commands
 
     def _find_table(self, lines, table_name):
         if len(lines) < 3:
             # length only <2 when fake iptables
             return (0, 0)
         try:
-            start = lines.index('*%s' % table_name) - 1
+            start = lines.index('*%s' % table_name)
         except ValueError:
             # Couldn't find table_name
             LOG.debug('Unable to find table %s', table_name)
             return (0, 0)
-        end = lines[start:].index('COMMIT') + start + 2
+        end = lines[start:].index('COMMIT') + start + 1
         return (start, end)
 
     def _find_rules_index(self, lines):
@@ -495,169 +630,92 @@ class IptablesManager(object):
 
         return rules_index
 
-    def _find_last_entry(self, filter_list, match_str):
-        # find a matching entry, starting from the bottom
-        for s in reversed(filter_list):
-            s = s.strip()
-            if match_str in s:
-                return s
-
     def _modify_rules(self, current_lines, table, table_name):
         # Chains are stored as sets to avoid duplicates.
         # Sort the output chains here to make their order predictable.
         unwrapped_chains = sorted(table.unwrapped_chains)
         chains = sorted(table.chains)
-        remove_chains = table.remove_chains
-        rules = table.rules
-        remove_rules = table.remove_rules
+        rules = set(map(str, table.rules))
 
-        if not current_lines:
-            fake_table = ['# Generated by iptables_manager',
-                          '*' + table_name, 'COMMIT',
-                          '# Completed by iptables_manager']
-            current_lines = fake_table
+        # we don't want to change any rules that don't belong to us so we start
+        # the new_filter with these rules
+        # there are some rules that belong to us but they don't have the wrap
+        # name. we want to add them in the right location in case our new rules
+        # changed the order
+        # (e.g. '-A FORWARD -j neutron-filter-top')
+        new_filter = [line.strip() for line in current_lines
+                      if self.wrap_name not in line and
+                      line.strip() not in rules]
 
-        # Fill old_filter with any chains or rules we might have added,
-        # they could have a [packet:byte] count we want to preserve.
-        # Fill new_filter with any chains or rules without our name in them.
-        old_filter, new_filter = [], []
-        for line in current_lines:
-            (old_filter if self.wrap_name in line else
-             new_filter).append(line.strip())
+        # generate our list of chain names
+        our_chains = [':%s-%s' % (self.wrap_name, name) for name in chains]
 
-        rules_index = self._find_rules_index(new_filter)
+        # the unwrapped chains (e.g. neutron-filter-top) may already exist in
+        # the new_filter since they aren't marked by the wrap_name so we only
+        # want to add them if they arent' already there
+        our_chains += [':%s' % name for name in unwrapped_chains
+                       if not any(':%s' % name in s for s in new_filter)]
 
-        all_chains = [':%s' % name for name in unwrapped_chains]
-        all_chains += [':%s-%s' % (self.wrap_name, name) for name in chains]
-
-        # Iterate through all the chains, trying to find an existing
-        # match.
-        our_chains = []
-        for chain in all_chains:
-            chain_str = str(chain).strip()
-
-            old = self._find_last_entry(old_filter, chain_str)
-            if not old:
-                dup = self._find_last_entry(new_filter, chain_str)
-            new_filter = [s for s in new_filter if chain_str not in s.strip()]
-
-            # if no old or duplicates, use original chain
-            if old or dup:
-                chain_str = str(old or dup)
-            else:
-                # add-on the [packet:bytes]
-                chain_str += ' - [0:0]'
-
-            our_chains += [chain_str]
-
-        # Iterate through all the rules, trying to find an existing
-        # match.
-        our_rules = []
-        bot_rules = []
-        for rule in rules:
-            rule_str = str(rule).strip()
-            # Further down, we weed out duplicates from the bottom of the
-            # list, so here we remove the dupes ahead of time.
-
-            old = self._find_last_entry(old_filter, rule_str)
-            if not old:
-                dup = self._find_last_entry(new_filter, rule_str)
-            new_filter = [s for s in new_filter if rule_str not in s.strip()]
-
-            # if no old or duplicates, use original rule
-            if old or dup:
-                rule_str = str(old or dup)
-                # backup one index so we write the array correctly
-                if not old:
-                    rules_index -= 1
-            else:
-                # add-on the [packet:bytes]
-                rule_str = '[0:0] ' + rule_str
+        our_top_rules = []
+        our_bottom_rules = []
+        for rule in table.rules:
+            rule_str = str(rule)
 
             if rule.top:
                 # rule.top == True means we want this rule to be at the top.
-                our_rules += [rule_str]
+                our_top_rules += [rule_str]
             else:
-                bot_rules += [rule_str]
+                our_bottom_rules += [rule_str]
 
-        our_rules += bot_rules
+        our_chains_and_rules = our_chains + our_top_rules + our_bottom_rules
 
-        new_filter[rules_index:rules_index] = our_rules
-        new_filter[rules_index:rules_index] = our_chains
-
-        def _strip_packets_bytes(line):
-            # strip any [packet:byte] counts at start or end of lines
-            if line.startswith(':'):
-                # it's a chain, for example, ":neutron-billing - [0:0]"
-                line = line.split(':')[1]
-                line = line.split(' - [', 1)[0]
-            elif line.startswith('['):
-                # it's a rule, for example, "[0:0] -A neutron-billing..."
-                line = line.split('] ', 1)[1]
-            line = line.strip()
-            return line
-
-        seen_chains = set()
-
-        def _weed_out_duplicate_chains(line):
-            # ignore [packet:byte] counts at end of lines
-            if line.startswith(':'):
-                line = _strip_packets_bytes(line)
-                if line in seen_chains:
-                    return False
-                else:
-                    seen_chains.add(line)
-
-            # Leave it alone
-            return True
-
-        seen_rules = set()
-
-        def _weed_out_duplicate_rules(line):
-            if line.startswith('['):
-                line = _strip_packets_bytes(line)
-                if line in seen_rules:
-                    return False
-                else:
-                    seen_rules.add(line)
-
-            # Leave it alone
-            return True
+        # locate the position immediately after the existing chains to insert
+        # our chains and rules
+        rules_index = self._find_rules_index(new_filter)
+        new_filter[rules_index:rules_index] = our_chains_and_rules
 
         def _weed_out_removes(line):
-            # We need to find exact matches here
+            # remove any rules or chains from the filter that were slated
+            # for removal
             if line.startswith(':'):
-                line = _strip_packets_bytes(line)
-                for chain in remove_chains:
-                    if chain == line:
-                        remove_chains.remove(chain)
-                        return False
-            elif line.startswith('['):
-                line = _strip_packets_bytes(line)
-                for rule in remove_rules:
-                    rule_str = _strip_packets_bytes(str(rule))
-                    if rule_str == line:
-                        remove_rules.remove(rule)
-                        return False
-
+                chain = line[1:]
+                if chain in table.remove_chains:
+                    table.remove_chains.remove(chain)
+                    return False
+            else:
+                if line in table.remove_rules:
+                    table.remove_rules.remove(line)
+                    return False
             # Leave it alone
             return True
 
-        # We filter duplicates.  Go through the chains and rules, letting
-        # the *last* occurrence take precedence since it could have a
-        # non-zero [packet:byte] count we want to preserve.  We also filter
-        # out anything in the "remove" list.
+        seen_lines = set()
+
+        # TODO(kevinbenton): remove this function and the next one. They are
+        # just oversized brooms to sweep bugs under the rug!!! We generate the
+        # rules and we shouldn't be generating duplicates.
+        def _weed_out_duplicates(line):
+            if line in seen_lines:
+                thing = 'chain' if line.startswith(':') else 'rule'
+                LOG.warning("Duplicate iptables %(thing)s detected. This "
+                            "may indicate a bug in the iptables "
+                            "%(thing)s generation code. Line: %(line)s",
+                            {'thing': thing, 'line': line})
+                return False
+            seen_lines.add(line)
+            # Leave it alone
+            return True
+
         new_filter.reverse()
         new_filter = [line for line in new_filter
-                      if _weed_out_duplicate_chains(line) and
-                      _weed_out_duplicate_rules(line) and
+                      if _weed_out_duplicates(line) and
                       _weed_out_removes(line)]
         new_filter.reverse()
 
-        # flush lists, just in case we didn't find something
-        remove_chains.clear()
-        for rule in remove_rules:
-            remove_rules.remove(rule)
+        # flush lists, just in case a rule or chain marked for removal
+        # was already gone. (chains is a set, rules is a list)
+        table.remove_chains.clear()
+        table.remove_rules = []
 
         return new_filter
 
@@ -678,15 +736,16 @@ class IptablesManager(object):
         """Return the sum of the traffic counters of all rules of a chain."""
         cmd_tables = self._get_traffic_counters_cmd_tables(chain, wrap)
         if not cmd_tables:
-            LOG.warn(_LW('Attempted to get traffic counters of chain %s which '
-                         'does not exist'), chain)
+            LOG.warning('Attempted to get traffic counters of chain %s '
+                        'which does not exist', chain)
             return
 
         name = get_chain_name(chain, wrap)
         acc = {'pkts': 0, 'bytes': 0}
 
         for cmd, table in cmd_tables:
-            args = [cmd, '-t', table, '-L', name, '-n', '-v', '-x']
+            args = [cmd, '-t', table, '-L', name, '-n', '-v', '-x',
+                    '-w', self.xlock_wait_time]
             if zero:
                 args.append('-Z')
             if self.namespace:
@@ -707,3 +766,80 @@ class IptablesManager(object):
                 acc['bytes'] += int(data[1])
 
         return acc
+
+
+def _generate_path_between_rules(old_rules, new_rules):
+    """Generates iptables commands to get from old_rules to new_rules.
+
+    This function diffs the two rule sets and then calculates the iptables
+    commands necessary to get from the old rules to the new rules using
+    insert and delete commands.
+    """
+    old_by_chain = _get_rules_by_chain(old_rules)
+    new_by_chain = _get_rules_by_chain(new_rules)
+    old_chains, new_chains = set(old_by_chain.keys()), set(new_by_chain.keys())
+    # all referenced chains should be declared at the top before rules.
+
+    # NOTE(kevinbenton): sorting and grouping chains is for determinism in
+    # tests. iptables doesn't care about the order here
+    statements = [':%s - [0:0]' % c for c in sorted(new_chains - old_chains)]
+    sg_chains = []
+    other_chains = []
+    for chain in sorted(old_chains | new_chains):
+        if '-sg-' in chain:
+            sg_chains.append(chain)
+        else:
+            other_chains.append(chain)
+
+    for chain in other_chains + sg_chains:
+        statements += _generate_chain_diff_iptables_commands(
+            chain, old_by_chain[chain], new_by_chain[chain])
+    # unreferenced chains get the axe
+    for chain in sorted(old_chains - new_chains):
+        statements += ['-X %s' % chain]
+    return statements
+
+
+def _get_rules_by_chain(rules):
+    by_chain = collections.defaultdict(list)
+    for line in rules:
+        if line.startswith(':'):
+            chain = line[1:].split(' ', 1)[0]
+            # even though this is a default dict, we need to manually add
+            # chains to ensure that ones without rules are included because
+            # they might be a jump reference
+            if chain not in by_chain:
+                by_chain[chain] = []
+        elif line.startswith('-A'):
+            chain = line[3:].split(' ', 1)[0]
+            by_chain[chain].append(line)
+    return by_chain
+
+
+def _generate_chain_diff_iptables_commands(chain, old_chain_rules,
+                                          new_chain_rules):
+    # keep track of the old index because we have to insert rules
+    # in the right position
+    old_index = 1
+    statements = []
+    for line in difflib.ndiff(old_chain_rules, new_chain_rules):
+        if line.startswith('?'):
+            # skip ? because that's a guide string for intraline differences
+            continue
+        elif line.startswith('-'):  # line deleted
+            statements.append('-D %s %d' % (chain, old_index))
+            # since we are removing a line from the old rules, we
+            # backup the index by 1
+            old_index -= 1
+        elif line.startswith('+'):  # line added
+            # strip the chain name since we have to add it before the index
+            rule = line[5:].split(' ', 1)[-1]
+            # IptablesRule does not add trailing spaces for rules, so we
+            # have to detect that here by making sure this chain isn't
+            # referencing itself
+            if rule == chain:
+                rule = ''
+            # rule inserted at this position
+            statements.append('-I %s %d %s' % (chain, old_index, rule))
+        old_index += 1
+    return statements

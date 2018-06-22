@@ -14,14 +14,16 @@
 #
 
 import datetime
-import Queue
 
 from oslo_utils import timeutils
+from six.moves import queue as Queue
 
 # Lower value is higher priority
 PRIORITY_RPC = 0
 PRIORITY_SYNC_ROUTERS_TASK = 1
+PRIORITY_PD_UPDATE = 2
 DELETE_ROUTER = 1
+PD_UPDATE = 2
 
 
 class RouterUpdate(object):
@@ -31,7 +33,7 @@ class RouterUpdate(object):
     and process a request to update a router.
     """
     def __init__(self, router_id, priority,
-                 action=None, router=None, timestamp=None):
+                 action=None, router=None, timestamp=None, tries=5):
         self.priority = priority
         self.timestamp = timestamp
         if not timestamp:
@@ -39,13 +41,14 @@ class RouterUpdate(object):
         self.id = router_id
         self.action = action
         self.router = router
+        self.tries = tries
 
     def __lt__(self, other):
         """Implements priority among updates
 
         Lower numerical priority always gets precedence.  When comparing two
         updates of the same priority then the one with the earlier timestamp
-        gets procedence.  In the unlikely event that the timestamps are also
+        gets precedence.  In the unlikely event that the timestamps are also
         equal it falls back to a simple comparison of ids meaning the
         precedence is essentially random.
         """
@@ -54,6 +57,9 @@ class RouterUpdate(object):
         if self.timestamp != other.timestamp:
             return self.timestamp < other.timestamp
         return self.id < other.id
+
+    def hit_retry_limit(self):
+        return self.tries < 0
 
 
 class ExclusiveRouterProcessor(object):
@@ -141,6 +147,7 @@ class RouterProcessingQueue(object):
         self._queue = Queue.PriorityQueue()
 
     def add(self, update):
+        update.tries -= 1
         self._queue.put(update)
 
     def each_update_to_next_router(self):

@@ -17,33 +17,34 @@
 import sys
 
 from oslo_config import cfg
+from oslo_service import service
 
-from neutron.agent.common import config
-from neutron.agent.dhcp import config as dhcp_config
-from neutron.agent.linux import interface
 from neutron.common import config as common_config
 from neutron.common import topics
-from neutron.openstack.common import service
+from neutron.conf.agent import common as config
+from neutron.conf.agent import dhcp as dhcp_config
+from neutron.conf.agent.metadata import config as meta_conf
 from neutron import service as neutron_service
 
 
-def register_options():
-    config.register_interface_driver_opts_helper(cfg.CONF)
-    config.register_use_namespaces_opts_helper(cfg.CONF)
-    config.register_agent_state_opts_helper(cfg.CONF)
-    cfg.CONF.register_opts(dhcp_config.DHCP_AGENT_OPTS)
-    cfg.CONF.register_opts(dhcp_config.DHCP_OPTS)
-    cfg.CONF.register_opts(dhcp_config.DNSMASQ_OPTS)
-    cfg.CONF.register_opts(interface.OPTS)
+def register_options(conf):
+    config.register_interface_driver_opts_helper(conf)
+    config.register_agent_state_opts_helper(conf)
+    config.register_availability_zone_opts_helper(conf)
+    dhcp_config.register_agent_dhcp_opts(conf)
+    meta_conf.register_meta_conf_opts(meta_conf.SHARED_OPTS, conf)
+    config.register_interface_opts(conf)
+    config.register_root_helper(conf)
 
 
 def main():
-    register_options()
+    register_options(cfg.CONF)
     common_config.init(sys.argv[1:])
     config.setup_logging()
+    config.setup_privsep()
     server = neutron_service.Service.create(
         binary='neutron-dhcp-agent',
         topic=topics.DHCP_AGENT,
         report_interval=cfg.CONF.AGENT.report_interval,
         manager='neutron.agent.dhcp.agent.DhcpAgentWithStateReport')
-    service.launch(server).wait()
+    service.launch(cfg.CONF, server).wait()

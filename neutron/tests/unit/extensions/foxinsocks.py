@@ -15,7 +15,10 @@
 
 import abc
 
+from neutron_lib.api import extensions as api_extensions
+from neutron_lib.services import base
 from oslo_serialization import jsonutils
+import six
 
 from neutron.api import extensions
 from neutron import wsgi
@@ -27,14 +30,15 @@ class FoxInSocksController(wsgi.Controller):
         return "Try to say this Mr. Knox, sir..."
 
 
-class FoxInSocksPluginInterface(extensions.PluginInterface):
+@six.add_metaclass(abc.ABCMeta)
+class FoxInSocksPluginInterface(base.ServicePluginBase):
 
     @abc.abstractmethod
     def method_to_support_foxnsox_extension(self):
         pass
 
 
-class Foxinsocks(object):
+class Foxinsocks(api_extensions.ExtensionDescriptor):
 
     def __init__(self):
         pass
@@ -50,9 +54,6 @@ class Foxinsocks(object):
 
     def get_description(self):
         return "The Fox In Socks Extension"
-
-    def get_namespace(self):
-        return "http://www.fox.in.socks/api/ext/pie/v1.0"
 
     def get_updated(self):
         return "2011-01-22T13:25:27-06:00"
@@ -80,7 +81,7 @@ class Foxinsocks(object):
             # You can use content type header to test for XML.
             data = jsonutils.loads(res.body)
             data['FOXNSOX:googoose'] = req.GET.get('chewing')
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dump_as_bytes(data)
             return res
 
         req_ext1 = extensions.RequestExtension('GET', '/dummy_resources/:(id)',
@@ -92,7 +93,7 @@ class Foxinsocks(object):
             # You can use content type header to test for XML.
             data = jsonutils.loads(res.body)
             data['FOXNSOX:big_bands'] = 'Pig Bands!'
-            res.body = jsonutils.dumps(data)
+            res.body = jsonutils.dump_as_bytes(data)
             return res
 
         req_ext2 = extensions.RequestExtension('GET', '/dummy_resources/:(id)',

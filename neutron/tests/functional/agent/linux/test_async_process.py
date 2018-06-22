@@ -13,10 +13,12 @@
 #    under the License.
 
 import eventlet
+import six
 
-from six import moves
-
+from neutron._i18n import _
 from neutron.agent.linux import async_process
+from neutron.agent.linux import utils
+from neutron.common import utils as common_utils
 from neutron.tests import base
 
 
@@ -25,8 +27,8 @@ class AsyncProcessTestFramework(base.BaseTestCase):
     def setUp(self):
         super(AsyncProcessTestFramework, self).setUp()
         self.test_file_path = self.get_temp_file_path('test_async_process.tmp')
-        self.data = [str(x) for x in moves.xrange(4)]
-        with file(self.test_file_path, 'w') as f:
+        self.data = [six.text_type(x) for x in range(4)]
+        with open(self.test_file_path, 'w') as f:
             f.writelines('%s\n' % item for item in self.data)
 
     def _check_stdout(self, proc):
@@ -50,9 +52,9 @@ class TestAsyncProcess(AsyncProcessTestFramework):
         proc = async_process.AsyncProcess(['tail', '-f',
                                            self.test_file_path])
         self.addCleanup(self._safe_stop, proc)
-        proc.start(blocking=True)
+        proc.start(block=True)
         self._check_stdout(proc)
-        proc.stop(blocking=True)
+        proc.stop(block=True)
 
         # Ensure that the process and greenthreads have stopped
         proc._process.wait()
@@ -69,5 +71,11 @@ class TestAsyncProcess(AsyncProcessTestFramework):
 
         # Ensure that the same output is read twice
         self._check_stdout(proc)
-        proc._kill_process(proc.pid)
+        pid = proc.pid
+        utils.execute(['kill', '-9', pid])
+        common_utils.wait_until_true(
+            lambda: proc.is_active() and pid != proc.pid,
+            timeout=5,
+            sleep=0.01,
+            exception=RuntimeError(_("Async process didn't respawn")))
         self._check_stdout(proc)

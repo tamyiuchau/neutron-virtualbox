@@ -20,10 +20,12 @@ Structure
 Useful links
 ------------
 
-* More about Rally: https://rally.readthedocs.org/en/latest/
+* More about Rally: https://rally.readthedocs.io/en/latest/
 
-* How to add rally-gates: https://rally.readthedocs.org/en/latest/rally_gatejob.html
+* Rally release notes: https://rally.readthedocs.io/en/latest/project_info/release_notes/archive.html
 
-* About plugins:  https://rally.readthedocs.org/en/latest/plugins.html
+* How to add rally-gates: http://rally.readthedocs.io/en/latest/quick_start/gates.html
 
-* Plugin samples: https://github.com/stackforge/rally/tree/master/doc/samples/plugins
+* About plugins:  https://rally.readthedocs.io/en/latest/plugins/index.html
+
+* Plugin samples: https://github.com/openstack/rally/tree/master/samples/plugins

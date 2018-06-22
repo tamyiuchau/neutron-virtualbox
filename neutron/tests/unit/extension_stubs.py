@@ -15,14 +15,17 @@
 
 import abc
 
-from neutron.api import extensions
+from neutron_lib.api import extensions as api_extensions
+from neutron_lib.services import base
+
 from neutron import wsgi
 
 
-class StubExtension(object):
+class StubExtension(api_extensions.ExtensionDescriptor):
 
-    def __init__(self, alias="stub_extension"):
+    def __init__(self, alias="stub_extension", optional=None):
         self.alias = alias
+        self.optional = optional or []
 
     def get_name(self):
         return "Stub Extension"
@@ -33,16 +36,23 @@ class StubExtension(object):
     def get_description(self):
         return ""
 
-    def get_namespace(self):
-        return ""
-
     def get_updated(self):
         return ""
+
+    def get_optional_extensions(self):
+        return self.optional
+
+
+class StubExtensionWithReqs(StubExtension):
+
+    def get_required_extensions(self):
+        return ["foo"]
 
 
 class StubPlugin(object):
 
-    def __init__(self, supported_extensions=[]):
+    def __init__(self, supported_extensions=None):
+        supported_extensions = supported_extensions or []
         self.supported_extension_aliases = supported_extensions
 
 
@@ -57,10 +67,16 @@ class ExtensionExpectingPluginInterface(StubExtension):
         return StubPluginInterface
 
 
-class StubPluginInterface(extensions.PluginInterface):
+class StubPluginInterface(base.ServicePluginBase):
 
     @abc.abstractmethod
     def get_foo(self, bar=None):
+        pass
+
+    def get_plugin_type(self):
+        pass
+
+    def get_plugin_description(self):
         pass
 
 

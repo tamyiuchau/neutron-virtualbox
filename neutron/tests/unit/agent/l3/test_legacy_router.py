@@ -1,4 +1,4 @@
-# Copyright (c) 2015 Openstack Foundation
+# Copyright (c) 2015 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,11 +13,14 @@
 #    under the License.
 
 import mock
+from neutron_lib import constants as lib_constants
+from oslo_utils import uuidutils
 
 from neutron.agent.l3 import legacy_router
 from neutron.agent.linux import ip_lib
-from neutron.common import constants as l3_constants
 from neutron.tests import base
+
+_uuid = uuidutils.generate_uuid
 
 
 class BasicRouterTestCaseFramework(base.BaseTestCase):
@@ -26,11 +29,12 @@ class BasicRouterTestCaseFramework(base.BaseTestCase):
             router = mock.MagicMock()
         self.agent_conf = mock.Mock()
         self.driver = mock.Mock()
-        return legacy_router.LegacyRouter(mock.sentinel.router_id,
+        self.router_id = _uuid()
+        return legacy_router.LegacyRouter(mock.Mock(),
+                                          self.router_id,
                                           router,
                                           self.agent_conf,
                                           self.driver,
-                                          ns_name=mock.sentinel.namespace,
                                           **kwargs)
 
 
@@ -43,35 +47,67 @@ class TestBasicRouterOperations(BasicRouterTestCaseFramework):
 
         ri.remove_floating_ip(device, cidr)
 
-        device.addr.delete.assert_called_once_with(4, cidr)
-        self.driver.delete_conntrack_state.assert_called_once_with(
-            ip=cidr,
-            namespace=mock.sentinel.namespace)
+        device.delete_addr_and_conntrack_state.assert_called_once_with(cidr)
+
+    def test_remove_external_gateway_ip(self):
+        ri = self._create_router(mock.MagicMock())
+        device = mock.Mock()
+        cidr = '172.16.0.0/24'
+
+        ri.remove_external_gateway_ip(device, cidr)
+
+        device.delete_addr_and_conntrack_state.assert_called_once_with(cidr)
+
+    @mock.patch.object(ip_lib, 'IPDevice')
+    def test_remove_multiple_external_gateway_ips(self, IPDevice):
+        ri = self._create_router(mock.MagicMock())
+        IPDevice.return_value = device = mock.Mock()
+        gw_ip_pri = '172.16.5.110'
+        gw_ip_sec = '172.16.5.111'
+        gw_ip6_pri = '2001:db8::1'
+        gw_ip6_sec = '2001:db8::2'
+        v4_prefixlen = 24
+        v6_prefixlen = 64
+        ex_gw_port = {'fixed_ips': [
+            {'ip_address': gw_ip_pri,
+             'prefixlen': v4_prefixlen},
+            {'ip_address': gw_ip_sec},
+            {'ip_address': gw_ip6_pri,
+             'prefixlen': v6_prefixlen},
+            {'ip_address': gw_ip6_sec}]}
+
+        ri.external_gateway_removed(ex_gw_port, "qg-fake-name")
+
+        cidr_pri = '%s/%s' % (gw_ip_pri, v4_prefixlen)
+        cidr_sec = '%s/%s' % (gw_ip_sec, lib_constants.IPv4_BITS)
+        cidr_v6 = '%s/%s' % (gw_ip6_pri, v6_prefixlen)
+        cidr_v6_sec = '%s/%s' % (gw_ip6_sec, lib_constants.IPv6_BITS)
+
+        device.delete_addr_and_conntrack_state.assert_has_calls(
+            [mock.call(cidr_pri), mock.call(cidr_sec),
+             mock.call(cidr_v6), mock.call(cidr_v6_sec)])
 
 
-@mock.patch.object(ip_lib, 'send_gratuitous_arp')
+@mock.patch.object(ip_lib, 'send_ip_addr_adv_notif')
 class TestAddFloatingIpWithMockGarp(BasicRouterTestCaseFramework):
-    def test_add_floating_ip(self, send_gratuitous_arp):
+    def test_add_floating_ip(self, send_ip_addr_adv_notif):
         ri = self._create_router()
         ri._add_fip_addr_to_device = mock.Mock(return_value=True)
-        self.agent_conf.send_arp_for_ha = mock.sentinel.arp_count
-        ri.ns_name = mock.sentinel.ns_name
         ip = '15.1.2.3'
         result = ri.add_floating_ip({'floating_ip_address': ip},
                                     mock.sentinel.interface_name,
                                     mock.sentinel.device)
-        ip_lib.send_gratuitous_arp.assert_called_once_with(
-            mock.sentinel.ns_name,
+        ip_lib.send_ip_addr_adv_notif.assert_called_once_with(
+            ri.ns_name,
             mock.sentinel.interface_name,
-            ip,
-            mock.sentinel.arp_count)
-        self.assertEqual(l3_constants.FLOATINGIP_STATUS_ACTIVE, result)
+            ip)
+        self.assertEqual(lib_constants.FLOATINGIP_STATUS_ACTIVE, result)
 
-    def test_add_floating_ip_error(self, send_gratuitous_arp):
+    def test_add_floating_ip_error(self, send_ip_addr_adv_notif):
         ri = self._create_router()
         ri._add_fip_addr_to_device = mock.Mock(return_value=False)
         result = ri.add_floating_ip({'floating_ip_address': '15.1.2.3'},
                                     mock.sentinel.interface_name,
                                     mock.sentinel.device)
-        self.assertFalse(ip_lib.send_gratuitous_arp.called)
-        self.assertEqual(l3_constants.FLOATINGIP_STATUS_ERROR, result)
+        self.assertFalse(ip_lib.send_ip_addr_adv_notif.called)
+        self.assertEqual(lib_constants.FLOATINGIP_STATUS_ERROR, result)
